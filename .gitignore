@@ -1,0 +1,10 @@
+.build/
+build/
+docs/
+.DS_Store
+Spike/capture_source
+Spike/ramp_source
+Spike/routing_spike
+Spike/tone_source
+*.xcodeproj/xcuserdata/
+DerivedData/

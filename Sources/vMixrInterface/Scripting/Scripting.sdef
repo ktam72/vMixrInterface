@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE dictionary SYSTEM "file://localhost/System/Library/DTDs/sdef.dtd">
+<dictionary>
+	<suite name="Test Suite" code="vmix" description="Test suite.">
+		<command name="vmixq" code="vmixq" description="A test command.">
+			<result type="text" description="Returns a greeting."/>
+		</command>
+	</suite>
+</dictionary>
