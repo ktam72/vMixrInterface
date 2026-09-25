@@ -3,7 +3,7 @@ import Combine
 import CoreAudio
 import AudioKit
 
-// REQ-030/031: the menu-bar status item (chevron icon) and its menu:
+// REQ-030/031: the menu-bar status item (「vM」monogram icon) and its menu:
 // 4 rows of「output device name + device volume slider + speaker icon」,
 // then「vMixrInterface」and「vMixrInterface を終了」.
 @MainActor
@@ -12,13 +12,27 @@ final class StatusItemController {
     private var cancellables = Set<AnyCancellable>()
     private var appliedOutputDevices: [AudioDeviceID] = []
 
-    // REQ-030: create the status item with the chevron icon and build the menu.
+    // REQ-030: create the status item with the 「vM」monogram icon and build the menu.
     func configure(mixer: MixerModel, deviceManager: DeviceManager) {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.image = NSImage(systemSymbolName: "chevron.up", accessibilityDescription: "vMixrInterface")
-        item.button?.image?.isTemplate = true
+        item.button?.image = Self.monogramImage()
         statusItem = item
         rebuildMenu(mixer: mixer, devices: deviceManager)
+    }
+
+    // REQ-030: render the 「vM」monogram (15pt bold, tight kern) as a template image
+    // so the menu bar auto-inverts it for light/dark appearance.
+    private static func monogramImage() -> NSImage? {
+        let font = NSFont.systemFont(ofSize: 15, weight: .bold)
+        let attrs: [NSAttributedString.Key: Any] = [.font: font, .kern: -0.5]
+        let text = NSAttributedString(string: "vM", attributes: attrs)
+        let size = text.size()
+        let image = NSImage(size: NSSize(width: ceil(size.width), height: ceil(size.height)))
+        image.lockFocus()
+        text.draw(at: .zero)
+        image.unlockFocus()
+        image.isTemplate = true
+        return image
     }
 
     // REQ-031: rebuild the menu when the mixer's output device selection changes.
