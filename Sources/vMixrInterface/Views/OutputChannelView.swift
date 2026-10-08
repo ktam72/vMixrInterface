@@ -14,18 +14,19 @@ struct OutputChannelView: View {
     let meterR: Double
     let peakL: Double
     let peakR: Double
-    @State private var volumeVersion = 0
+    // CR-012: cached by MixerView.pollMeters (REQ-019) so the body does not
+    // query Core Audio on every render.
+    let volume: Double
+    let volumeSupported: Bool
 
     var body: some View {
-        let _ = volumeVersion
         let output = mixer.outputs[index]
         let levelBinding = Binding<Double>(
             get: { GainStep.levelToDB(mixer.outputs[index].level) },
             set: { mixer.outputs[index].level = GainStep.dbToLevel($0); applyAfterChange() }
         )
-        let hasDevice = output.deviceID != 0
-        let deviceVolume = hasDevice ? (DeviceVolume.get(output.deviceID).map { Double($0) } ?? 1.0) : 0.0
-        let supportsVolume = hasDevice && DeviceVolume.get(output.deviceID) != nil
+        let deviceVolume = volume
+        let supportsVolume = volumeSupported
         return VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 4) {
                 Text(outputName(index)).font(.subheadline.bold())
@@ -81,7 +82,6 @@ struct OutputChannelView: View {
                             guard supportsVolume else { return }
                             let v = min(1, max(0, g.location.x / max(w, 1)))
                             _ = DeviceVolume.set(output.deviceID, Float(v))
-                            volumeVersion &+= 1
                         }
                     )
                 }
