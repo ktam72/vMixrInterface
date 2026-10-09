@@ -1,5 +1,6 @@
 import SwiftUI
 import Combine
+import AppKit
 import AudioKit
 
 // REQ-010..020: the mixer window. Left column = 4 input channels, right column =
@@ -26,7 +27,13 @@ struct MixerView: View {
     @State private var outputVolumes = Array(repeating: 1.0, count: MixerModel.outputCount)
     @State private var outputVolumeSupported = Array(repeating: false, count: MixerModel.outputCount)
 
-    private let meterTimer = Timer.publish(every: 1.0 / 60.0, on: .main, in: .common).autoconnect()
+    // CR-013 (REQ-010..020): the meter timer exists only while the mixer window
+    // is visible. A Window scene keeps its content view alive after the window
+    // closes, so pollMeters also self-stops when no mixer window is on screen.
+    @State private var meterCancellable: AnyCancellable?
+    // CR-013 (REQ-019): device master volume is polled at 10Hz, not with the
+    // 60Hz meter ticks (Core Audio property queries are comparatively costly).
+    @State private var volumePollTick = 0
 
     var body: some View {
         // Each row pairs 入力N with the Nth output (メイン/Aux1/Aux2/Aux3) so the
@@ -50,7 +57,30 @@ struct MixerView: View {
         }
         .padding(8)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .onReceive(meterTimer) { _ in pollMeters() }
+        .onAppear { startMeterTimer() }
+        .onDisappear { stopMeterTimer() }
+    }
+
+    // CR-013: start the 60Hz meter timer (common run-loop mode so it keeps
+    // firing during slider drags).
+    private func startMeterTimer() {
+        guard meterCancellable == nil else { return }
+        meterCancellable = Timer.publish(every: 1.0 / 60.0, on: .main, in: .common)
+            .autoconnect()
+            .sink { _ in pollMeters() }
+    }
+
+    // CR-013: stop the timer; called from onDisappear and from pollMeters when
+    // the window has been closed without the scene tearing the view down.
+    private func stopMeterTimer() {
+        meterCancellable?.cancel()
+        meterCancellable = nil
+    }
+
+    // CR-013: a closed Window scene leaves its content view subscribed, so
+    // visibility is read from AppKit instead of inferred from onDisappear.
+    private var mixerWindowVisible: Bool {
+        NSApp.windows.contains { $0.title == "vMixrInterface" && $0.isVisible }
     }
 
     // Poll the engine's raw per-channel peaks and hold the peak with a ~500ms decay.
@@ -60,6 +90,9 @@ struct MixerView: View {
     // 5e-7 corresponds to <0.1px on a ~600pt bar, so the frozen steady state is
     // visually identical to a continuous decay.
     private func pollMeters() {
+        // CR-013: closed window - stop the timer rather than polling Core Audio
+        // and writing @State at 60Hz for a view nobody sees.
+        guard mixerWindowVisible else { stopMeterTimer(); return }
         // 60fps per-tick decays (recomputed from the 10fps values 0.85 / 0.985 so
         // the visual falloff rate is unchanged).
         let decay = 0.9733
@@ -86,15 +119,19 @@ struct MixerView: View {
             let pr = max(Double(peaks.outputR[j]), outputPeaksR[j] * peakDecay)
             if abs(pr - outputPeaksR[j]) > epsilon { outputPeaksR[j] = pr }
         }
-        // REQ-019: refresh the cached device volumes. A step below 1e-6 is
-        // subpixel; skipping that write keeps silent idle free of invalidations.
-        for j in 0..<MixerModel.outputCount {
-            let id = mixer.outputs[j].deviceID
-            let raw = id != 0 ? DeviceVolume.get(id) : nil
-            let volume = raw.map { Double($0) } ?? (id != 0 ? 1.0 : 0.0)
-            if abs(volume - outputVolumes[j]) > 1e-6 { outputVolumes[j] = volume }
-            let supported = raw != nil
-            if outputVolumeSupported[j] != supported { outputVolumeSupported[j] = supported }
+        // REQ-019 (CR-013): refresh the cached device volumes at 10Hz. A step
+        // below 1e-6 is subpixel; skipping that write keeps silent idle free of
+        // invalidations.
+        volumePollTick += 1
+        if volumePollTick % 6 == 0 {
+            for j in 0..<MixerModel.outputCount {
+                let id = mixer.outputs[j].deviceID
+                let raw = id != 0 ? DeviceVolume.get(id) : nil
+                let volume = raw.map { Double($0) } ?? (id != 0 ? 1.0 : 0.0)
+                if abs(volume - outputVolumes[j]) > 1e-6 { outputVolumes[j] = volume }
+                let supported = raw != nil
+                if outputVolumeSupported[j] != supported { outputVolumeSupported[j] = supported }
+            }
         }
     }
 }

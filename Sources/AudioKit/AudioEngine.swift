@@ -28,6 +28,9 @@ public final class AudioEngine: ObservableObject {
     static let ringFrames = 16384        // ~340ms at 48k
     // Steady-state lag of a read head behind its source write head (frames).
     static let readLagFrames = 1536      // ~32ms at 48k
+    // REQ-016 (CR-013): peak below this counts as silence (-100dBFS, far under
+    // any audible signal) and lets render skip mixing that source.
+    static let silenceEpsilon: Float = 1e-5
 
     // One endpoint per device in use: the device's IOProc, its captured input
     // ring, and the output buses assigned to that device.
@@ -42,6 +45,12 @@ public final class AudioEngine: ObservableObject {
         var hasInput = false
         var hasOutput = false
         var buses: [Int] = []                    // output buses on this device
+        // REQ-005/021 (CR-013): only devices feeding an input channel capture.
+        var captureNeeded = false
+        // REQ-016 (CR-013): absolute frame where continuous silence starts.
+        // Frames >= this value are silent (below silenceEpsilon), so a read
+        // window entirely inside it can skip the mix loop.
+        var silentSinceFrame = 0
         var inPeakL: Float = 0, inPeakR: Float = 0
         var outPeakL: Float = 0, outPeakR: Float = 0
         init(engine: AudioEngine, device: AudioDeviceID) {
@@ -158,7 +167,9 @@ public final class AudioEngine: ObservableObject {
         }
 
         for i in 0..<AudioEngine.inputCount where inputChannels[i].deviceID != 0 {
-            inputEndpoint[i] = endpoint(for: inputChannels[i].deviceID)
+            let ep = endpoint(for: inputChannels[i].deviceID)
+            ep.captureNeeded = true
+            inputEndpoint[i] = ep
         }
         for j in 0..<AudioEngine.outputCount where outputChannels[j].deviceID != 0 {
             let ep = endpoint(for: outputChannels[j].deviceID)
@@ -299,7 +310,9 @@ public final class AudioEngine: ObservableObject {
                           outOutput: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus {
         lock.lock()
         defer { lock.unlock() }
-        if ep.hasInput, let inInput { capture(ep, inInput) }
+        // REQ-005/021 (CR-013): a full-duplex device used only as an output has
+        // no reader for its input ring, so capturing it is wasted work.
+        if ep.captureNeeded, let inInput { capture(ep, inInput) }
         if ep.hasOutput, let outOutput { render(ep, outOutput) }
         return noErr
     }
@@ -331,6 +344,11 @@ public final class AudioEngine: ObservableObject {
             }
         }
         ep.write += n
+        // REQ-016 (CR-013): any audible sample in this block pushes the silence
+        // start past it, so render keeps mixing until the source goes quiet.
+        if max(pl, pr) >= Self.silenceEpsilon {
+            ep.silentSinceFrame = ep.write
+        }
         ep.inPeakL = pl
         ep.inPeakR = pr
         inputFramesPulled += n
@@ -355,16 +373,53 @@ public final class AudioEngine: ObservableObject {
         guard n > 0 else { return }
         let outRate = ep.rate > 0 ? ep.rate : 48000
 
+        // REQ-016/022 (CR-013): decide once per block which (input, bus) pairs
+        // are worth mixing. A pair is skipped when its bus/input is inactive,
+        // its level is zero, or its read window lies entirely inside the
+        // source's tracked silence - all of which contribute exactly zero.
+        var pairMask: UInt16 = 0
+        var busMask: UInt16 = 0
+        for j in ep.buses where j < AudioEngine.outputCount && outputActive[j] && outputLevel[j] != 0 {
+            for i in busRouting[j] where i < AudioEngine.inputCount && inputActive[i] {
+                guard let src = inputEndpoint[i], src.ring != nil, src.inChannels > 0 else { continue }
+                guard readHeads[i][j] < Double(src.silentSinceFrame) else { continue }
+                pairMask |= UInt16(1) << UInt16(i * AudioEngine.outputCount + j)
+                busMask |= UInt16(1) << UInt16(j)
+            }
+        }
+
+        // REQ-016 (CR-013): nothing to mix (silent idle, inactive bus, or an
+        // input-only device with no buses) - write silence instead of running
+        // the mix loop.
+        if busMask == 0 {
+            zeroFill(bufs, numBuf: Int(abl.pointee.mNumberBuffers))
+            if ep.buses.contains(0) {
+                for _ in 0..<n { appendDump(l: 0, r: 0, rate: outRate) }
+            }
+            outputFramesRendered += n
+            ep.outPeakL = 0
+            ep.outPeakR = 0
+            meterLock.lock()
+            for j in ep.buses where j < AudioEngine.outputCount {
+                outputLPeaks[j] = 0
+                outputRPeaks[j] = 0
+            }
+            meterLock.unlock()
+            return
+        }
+
         var peakL: Float = 0
         var peakR: Float = 0
         for f in 0..<n {
             var l: Float = 0
             var r: Float = 0
-            for j in ep.buses where j < AudioEngine.outputCount && outputActive[j] {
+            for j in ep.buses where j < AudioEngine.outputCount && outputActive[j]
+                && ((busMask >> UInt16(j)) & 1) == 1 {
                 let level = outputLevel[j]
                 var bl: Float = 0
                 var br: Float = 0
-                for i in busRouting[j] where i < AudioEngine.inputCount && inputActive[i] {
+                for i in busRouting[j] where i < AudioEngine.inputCount && inputActive[i]
+                    && ((pairMask >> UInt16(i * AudioEngine.outputCount + j)) & 1) == 1 {
                     guard let src = inputEndpoint[i], let sring = src.ring, src.inChannels > 0 else { continue }
                     let pos = readHeads[i][j] + Double(f) * (src.rate / outRate)
                     let fi = Int(pos.rounded(.down))
@@ -423,6 +478,20 @@ public final class AudioEngine: ObservableObject {
             for b in 0..<numBuf {
                 guard let dst = bufs[b].mData?.assumingMemoryBound(to: Float.self) else { continue }
                 dst[f] = (b == 0) ? l : ((b == 1) ? r : 0)
+            }
+        }
+    }
+
+    // REQ-016 (CR-013): write silence to the whole output block, honouring the
+    // same interleaved / per-channel layouts as writeFrame.
+    private func zeroFill(_ bufs: UnsafeMutablePointer<AudioBuffer>, numBuf: Int) {
+        if numBuf <= 1 {
+            guard let dst = bufs[0].mData?.assumingMemoryBound(to: Float.self) else { return }
+            dst.initialize(repeating: 0, count: Int(bufs[0].mDataByteSize) / 4)
+        } else {
+            for b in 0..<numBuf {
+                guard let dst = bufs[b].mData?.assumingMemoryBound(to: Float.self) else { continue }
+                dst.initialize(repeating: 0, count: Int(bufs[b].mDataByteSize) / 4)
             }
         }
     }
